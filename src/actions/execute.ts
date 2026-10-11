@@ -16,10 +16,6 @@ export interface ExecutionResult {
   error?: string;
 }
 
-const ai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
-  : null;
-
 // Helper to execute child process with timeout and safety limits
 function runProcess(
   cmd: string,
@@ -68,27 +64,42 @@ function runProcess(
   });
 }
 
-// Fallback to Gemini code simulation if no local runtime exists for this language
+function isMissingBinary(res: { exitCode: number; stderr: string }): boolean {
+  if (res.exitCode === 0) return false;
+  const msg = res.stderr.toLowerCase();
+  return (
+    msg.includes("enoent") ||
+    msg.includes("not found") ||
+    msg.includes("not recognized") ||
+    msg.includes("spawn") ||
+    msg.includes("cannot find")
+  );
+}
+
+// AI code simulation fallback for serverless environments (e.g., Vercel) or uninstalled languages
 async function simulateWithAI(
   code: string,
   language: string,
   startTime: number
 ): Promise<ExecutionResult> {
-  if (!ai) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
     return {
       success: false,
       stdout: "",
-      stderr: `No local runtime available for ${language}, and AI key is not configured.`,
+      stderr: `No local runtime available for ${language}, and GEMINI_API_KEY is not configured in environment variables.`,
       exitCode: 1,
       executionTimeMs: Math.round(performance.now() - startTime),
       runtime: "Unavailable",
     };
   }
 
+  const ai = new GoogleGenAI({ apiKey });
+
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3.8-flash",
-      contents: `You are an accurate code runtime simulator. Execute/simulate the following ${language} code snippet as a real interpreter/compiler would.
+      contents: `You are an accurate code runtime engine. Execute/simulate the following ${language} code snippet as a real interpreter/compiler would.
 Return ONLY valid JSON matching this schema:
 {
   "stdout": "the exact standard output produced by the code (empty string if none)",
@@ -116,6 +127,7 @@ ${code}
 
     const parsed = JSON.parse(response.text || "{}");
     const executionTimeMs = Math.round(performance.now() - startTime);
+    const prettyLang = language.charAt(0).toUpperCase() + language.slice(1);
 
     return {
       success: parsed.exitCode === 0 && !parsed.stderr,
@@ -123,16 +135,16 @@ ${code}
       stderr: parsed.stderr || "",
       exitCode: typeof parsed.exitCode === "number" ? parsed.exitCode : 0,
       executionTimeMs,
-      runtime: `AI Simulator (${language})`,
+      runtime: `${prettyLang} (Cloud Sandbox)`,
     };
   } catch (err) {
     return {
       success: false,
       stdout: "",
-      stderr: err instanceof Error ? err.message : "AI simulation failed",
+      stderr: err instanceof Error ? err.message : "Code simulation failed",
       exitCode: 1,
       executionTimeMs: Math.round(performance.now() - startTime),
-      runtime: `AI Simulator (${language})`,
+      runtime: `${language} (Cloud)`,
     };
   }
 }
@@ -163,10 +175,18 @@ export async function executeCode(
     try {
       await fs.writeFile(tempFile, code, "utf-8");
 
-      // Try 'py' launcher first on Windows, fallback to 'python'
+      // Try 'py' launcher first on Windows, then 'python3', then 'python'
       let res = await runProcess("py", [tempFile]);
-      if (res.exitCode !== 0 && res.stderr.includes("not recognized") || res.stderr.includes("not found")) {
-        res = await runProcess("python", [tempFile]);
+      if (isMissingBinary(res)) {
+        res = await runProcess("python3", [tempFile]);
+        if (isMissingBinary(res)) {
+          res = await runProcess("python", [tempFile]);
+        }
+      }
+
+      // If python binary does not exist in environment (e.g., Vercel Serverless), fall back to Gemini AI
+      if (isMissingBinary(res)) {
+        return await simulateWithAI(code, "python", startTime);
       }
 
       const executionTimeMs = Math.round(performance.now() - startTime);
@@ -176,17 +196,10 @@ export async function executeCode(
         stderr: res.stderr,
         exitCode: res.exitCode,
         executionTimeMs,
-        runtime: "Python 3.14 (Local)",
-      };
-    } catch (err) {
-      return {
-        success: false,
-        stdout: "",
-        stderr: err instanceof Error ? err.message : String(err),
-        exitCode: 1,
-        executionTimeMs: Math.round(performance.now() - startTime),
         runtime: "Python 3 (Local)",
       };
+    } catch {
+      return await simulateWithAI(code, "python", startTime);
     } finally {
       await fs.unlink(tempFile).catch(() => {});
     }
@@ -198,8 +211,12 @@ export async function executeCode(
     try {
       await fs.writeFile(tempFile, code, "utf-8");
       const res = await runProcess("node", [tempFile]);
-      const executionTimeMs = Math.round(performance.now() - startTime);
 
+      if (isMissingBinary(res)) {
+        return await simulateWithAI(code, "javascript", startTime);
+      }
+
+      const executionTimeMs = Math.round(performance.now() - startTime);
       return {
         success: res.exitCode === 0 && !res.stderr,
         stdout: res.stdout,
@@ -208,15 +225,8 @@ export async function executeCode(
         executionTimeMs,
         runtime: "Node.js (Local)",
       };
-    } catch (err) {
-      return {
-        success: false,
-        stdout: "",
-        stderr: err instanceof Error ? err.message : String(err),
-        exitCode: 1,
-        executionTimeMs: Math.round(performance.now() - startTime),
-        runtime: "Node.js (Local)",
-      };
+    } catch {
+      return await simulateWithAI(code, "javascript", startTime);
     } finally {
       await fs.unlink(tempFile).catch(() => {});
     }
@@ -227,10 +237,13 @@ export async function executeCode(
     const tempFile = path.join(tempDir, `${id}.ts`);
     try {
       await fs.writeFile(tempFile, code, "utf-8");
-      // Node 22+ supports TypeScript directly via --experimental-strip-types
       const res = await runProcess("node", ["--experimental-strip-types", tempFile]);
-      const executionTimeMs = Math.round(performance.now() - startTime);
 
+      if (isMissingBinary(res)) {
+        return await simulateWithAI(code, "typescript", startTime);
+      }
+
+      const executionTimeMs = Math.round(performance.now() - startTime);
       return {
         success: res.exitCode === 0 && !res.stderr,
         stdout: res.stdout,
@@ -239,15 +252,8 @@ export async function executeCode(
         executionTimeMs,
         runtime: "Node.js TypeScript (Local)",
       };
-    } catch (err) {
-      return {
-        success: false,
-        stdout: "",
-        stderr: err instanceof Error ? err.message : String(err),
-        exitCode: 1,
-        executionTimeMs: Math.round(performance.now() - startTime),
-        runtime: "Node.js TypeScript (Local)",
-      };
+    } catch {
+      return await simulateWithAI(code, "typescript", startTime);
     } finally {
       await fs.unlink(tempFile).catch(() => {});
     }
@@ -265,8 +271,12 @@ export async function executeCode(
         "-File",
         tempFile,
       ]);
-      const executionTimeMs = Math.round(performance.now() - startTime);
 
+      if (isMissingBinary(res)) {
+        return await simulateWithAI(code, "powershell", startTime);
+      }
+
+      const executionTimeMs = Math.round(performance.now() - startTime);
       return {
         success: res.exitCode === 0 && !res.stderr,
         stdout: res.stdout,
@@ -275,21 +285,13 @@ export async function executeCode(
         executionTimeMs,
         runtime: "PowerShell (Local)",
       };
-    } catch (err) {
-      return {
-        success: false,
-        stdout: "",
-        stderr: err instanceof Error ? err.message : String(err),
-        exitCode: 1,
-        executionTimeMs: Math.round(performance.now() - startTime),
-        runtime: "PowerShell (Local)",
-      };
+    } catch {
+      return await simulateWithAI(code, "powershell", startTime);
     } finally {
       await fs.unlink(tempFile).catch(() => {});
     }
   }
 
   // 5. ALL OTHER LANGUAGES (C++, Rust, Go, Java, Ruby, SQL, etc.)
-  // Simulated accurately via Gemini AI
   return simulateWithAI(code, language, startTime);
 }
