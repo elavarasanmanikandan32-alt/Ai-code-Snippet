@@ -76,6 +76,12 @@ function isMissingBinary(res: { exitCode: number; stderr: string }): boolean {
   );
 }
 
+const GEMINI_MODELS = [
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.8-flash",
+];
+
 // AI code simulation fallback for serverless environments (e.g., Vercel) or uninstalled languages
 async function simulateWithAI(
   code: string,
@@ -95,11 +101,7 @@ async function simulateWithAI(
   }
 
   const ai = new GoogleGenAI({ apiKey });
-
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: `You are an accurate code runtime engine. Execute/simulate the following ${language} code snippet as a real interpreter/compiler would.
+  const contents = `You are an accurate code runtime engine. Execute/simulate the following ${language} code snippet as a real interpreter/compiler would.
 Return ONLY valid JSON matching this schema:
 {
   "stdout": "the exact standard output produced by the code (empty string if none)",
@@ -110,22 +112,54 @@ Return ONLY valid JSON matching this schema:
 Code:
 \`\`\`${language}
 ${code}
-\`\`\``,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "object" as const,
-          properties: {
-            stdout: { type: "string" as const },
-            stderr: { type: "string" as const },
-            exitCode: { type: "number" as const },
-          },
-          required: ["stdout", "stderr", "exitCode"],
-        },
-      },
-    });
+\`\`\``;
 
-    const parsed = JSON.parse(response.text || "{}");
+  const config = {
+    responseMimeType: "application/json",
+    responseSchema: {
+      type: "object" as const,
+      properties: {
+        stdout: { type: "string" as const },
+        stderr: { type: "string" as const },
+        exitCode: { type: "number" as const },
+      },
+      required: ["stdout", "stderr", "exitCode"],
+    },
+  };
+
+  let responseText: string | null = null;
+  let lastError: Error | null = null;
+
+  for (const model of GEMINI_MODELS) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents,
+        config,
+      });
+      if (response.text) {
+        responseText = response.text;
+        break;
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`Model ${model} unavailable (retrying next model):`, err);
+    }
+  }
+
+  if (!responseText) {
+    return {
+      success: false,
+      stdout: "",
+      stderr: lastError?.message || "Execution service temporarily unavailable.",
+      exitCode: 1,
+      executionTimeMs: Math.round(performance.now() - startTime),
+      runtime: `${language} (Cloud)`,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(responseText);
     const executionTimeMs = Math.round(performance.now() - startTime);
     const prettyLang = language.charAt(0).toUpperCase() + language.slice(1);
 
@@ -141,7 +175,7 @@ ${code}
     return {
       success: false,
       stdout: "",
-      stderr: err instanceof Error ? err.message : "Code simulation failed",
+      stderr: err instanceof Error ? err.message : "Failed to parse execution output",
       exitCode: 1,
       executionTimeMs: Math.round(performance.now() - startTime),
       runtime: `${language} (Cloud)`,
