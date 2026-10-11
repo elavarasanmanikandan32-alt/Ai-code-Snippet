@@ -5,58 +5,96 @@ import { prisma } from "@/lib/prisma";
 import { analyzeSnippet } from "@/lib/gemini";
 import { revalidatePath } from "next/cache";
 
-// Sync Clerk user to our database
-export async function syncUser() {
-  const user = await currentUser();
-  if (!user) return null;
+export interface ActionResult<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
 
-  return prisma.user.upsert({
-    where: { id: user.id },
-    update: {
-      email: user.emailAddresses[0]?.emailAddress || "",
-      name: `${user.firstName || ""} ${user.lastName || ""}`.trim() || null,
-      avatarUrl: user.imageUrl || null,
-    },
-    create: {
-      id: user.id,
-      email: user.emailAddresses[0]?.emailAddress || "",
-      name: `${user.firstName || ""} ${user.lastName || ""}`.trim() || null,
-      avatarUrl: user.imageUrl || null,
-    },
-  });
+// Sync Clerk user to our database safely
+export async function syncUser(forcedUserId?: string) {
+  try {
+    const { userId: authUserId } = await auth();
+    const id = forcedUserId || authUserId;
+    if (!id) return null;
+
+    let user = null;
+    try {
+      user = await currentUser();
+    } catch (e) {
+      console.warn("Could not retrieve currentUser from Clerk:", e);
+    }
+
+    const email =
+      user?.emailAddresses?.[0]?.emailAddress ||
+      `${id}@clerk.user`;
+
+    const name = user
+      ? `${user.firstName || ""} ${user.lastName || ""}`.trim() || null
+      : null;
+
+    return await prisma.user.upsert({
+      where: { id },
+      update: {
+        email,
+        name,
+        avatarUrl: user?.imageUrl || null,
+      },
+      create: {
+        id,
+        email,
+        name,
+        avatarUrl: user?.imageUrl || null,
+      },
+    });
+  } catch (err) {
+    console.error("syncUser error:", err);
+    return null;
+  }
 }
 
 // Create a new snippet
-export async function createSnippet(formData: FormData) {
-  const { userId } = await auth();
-  if (!userId) throw new Error("Unauthorized");
+export async function createSnippet(formData: FormData): Promise<ActionResult> {
+  try {
+    const { userId } = await auth();
+    if (!userId) {
+      return { success: false, error: "Unauthorized. Please sign in again." };
+    }
 
-  await syncUser();
+    // Always ensure user exists in database for the foreign key
+    await syncUser(userId);
 
-  const title = formData.get("title") as string;
-  const content = formData.get("content") as string;
-  const language = formData.get("language") as string;
+    const title = formData.get("title") as string;
+    const content = formData.get("content") as string;
+    const language = formData.get("language") as string;
 
-  if (!title || !content || !language) {
-    throw new Error("Title, content, and language are required");
+    if (!title || !content || !language) {
+      return { success: false, error: "Title, content, and language are required." };
+    }
+
+    // Get AI-generated tags and summary (safe fallback inside analyzeSnippet)
+    const analysis = await analyzeSnippet(content, language);
+
+    const snippet = await prisma.snippet.create({
+      data: {
+        userId,
+        title: title.trim(),
+        content,
+        language,
+        tags: analysis.tags,
+        summary: analysis.summary,
+      },
+    });
+
+    revalidatePath("/dashboard");
+    return { success: true, data: snippet };
+  } catch (err) {
+    console.error("createSnippet failed:", err);
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Failed to create snippet in database.",
+    };
   }
-
-  // Get AI-generated tags and summary
-  const analysis = await analyzeSnippet(content, language);
-
-  const snippet = await prisma.snippet.create({
-    data: {
-      userId,
-      title,
-      content,
-      language,
-      tags: analysis.tags,
-      summary: analysis.summary,
-    },
-  });
-
-  revalidatePath("/dashboard");
-  return snippet;
 }
 
 // Get all snippets for the current user
@@ -107,44 +145,58 @@ export async function getSnippetById(id: string) {
 }
 
 // Update a snippet
-export async function updateSnippet(formData: FormData) {
-  const { userId } = await auth();
-  if (!userId) throw new Error("Unauthorized");
+export async function updateSnippet(formData: FormData): Promise<ActionResult> {
+  try {
+    const { userId } = await auth();
+    if (!userId) {
+      return { success: false, error: "Unauthorized. Please sign in again." };
+    }
 
-  const id = formData.get("id") as string;
-  const title = formData.get("title") as string;
-  const content = formData.get("content") as string;
-  const language = formData.get("language") as string;
+    const id = formData.get("id") as string;
+    const title = formData.get("title") as string;
+    const content = formData.get("content") as string;
+    const language = formData.get("language") as string;
 
-  const existing = await prisma.snippet.findUnique({ where: { id } });
-  if (!existing || existing.userId !== userId) {
-    throw new Error("Snippet not found");
+    if (!id) {
+      return { success: false, error: "Snippet ID is required." };
+    }
+
+    const existing = await prisma.snippet.findUnique({ where: { id } });
+    if (!existing || existing.userId !== userId) {
+      return { success: false, error: "Snippet not found or unauthorized." };
+    }
+
+    // Re-analyze with AI if content changed
+    let tags = existing.tags;
+    let summary = existing.summary;
+
+    if (content !== existing.content || language !== existing.language) {
+      const analysis = await analyzeSnippet(content, language);
+      tags = analysis.tags;
+      summary = analysis.summary;
+    }
+
+    const snippet = await prisma.snippet.update({
+      where: { id },
+      data: {
+        title: title ? title.trim() : existing.title,
+        content: content || existing.content,
+        language: language || existing.language,
+        tags,
+        summary,
+      },
+    });
+
+    revalidatePath("/dashboard");
+    revalidatePath(`/dashboard/${id}`);
+    return { success: true, data: snippet };
+  } catch (err) {
+    console.error("updateSnippet failed:", err);
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Failed to update snippet in database.",
+    };
   }
-
-  // Re-analyze with AI if content changed
-  let tags = existing.tags;
-  let summary = existing.summary;
-
-  if (content !== existing.content || language !== existing.language) {
-    const analysis = await analyzeSnippet(content, language);
-    tags = analysis.tags;
-    summary = analysis.summary;
-  }
-
-  const snippet = await prisma.snippet.update({
-    where: { id },
-    data: {
-      title: title || existing.title,
-      content: content || existing.content,
-      language: language || existing.language,
-      tags,
-      summary,
-    },
-  });
-
-  revalidatePath("/dashboard");
-  revalidatePath(`/dashboard/${id}`);
-  return snippet;
 }
 
 // Delete a snippet

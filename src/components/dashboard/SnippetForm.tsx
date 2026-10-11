@@ -145,16 +145,20 @@ export function SnippetForm({ mode, initialData }: SnippetFormProps) {
         formData.set("content", content);
         formData.set("language", language);
 
-        if (mode === "create") {
-          await createSnippet(formData);
-        } else {
-          await updateSnippet(formData);
+        const res =
+          mode === "create"
+            ? await createSnippet(formData)
+            : await updateSnippet(formData);
+
+        if (!res.success) {
+          setError(res.error || "Failed to save snippet.");
+          return;
         }
 
         router.push("/dashboard");
         router.refresh();
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Something went wrong");
+        setError(err instanceof Error ? err.message : "Something went wrong.");
       }
     });
   };
